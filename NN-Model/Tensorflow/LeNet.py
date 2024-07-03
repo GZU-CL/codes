@@ -1,4 +1,4 @@
-##    python3.9    DataSet:MNIST
+##    Python3.9    DataSet:MNIST
 import tensorflow as tf
 import tensorboard
 from tensorflow import keras
