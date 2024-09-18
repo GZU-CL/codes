@@ -1,0 +1,262 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+#自注意力
+class SelfAttention(nn.Module):
+    def __init__(self, seq_length):
+        super(SelfAttention, self).__init__()
+        self.input_size = seq_length
+        # 定义三个权重矩阵
+        self.Wq = nn.Linear(seq_length, seq_length)  # 不改变形状的线性变换
+        self.Wk = nn.Linear(seq_length, seq_length)
+        self.Wv = nn.Linear(seq_length, seq_length)
+
+    def forward(self, input):
+        # 计算Q,K,V 三个矩阵
+        q = self.Wq(input)
+        k = self.Wk(input)
+        v = self.Wv(input)
+
+        # 计算QK^T，即向量之间的相关度 ; 这里可以理解dk了：torch.tensor(float(self.input_size))，是Wk的维度。
+        attention_scores = torch.matmul(q, k.transpose(-1, -2)) / torch.sqrt(torch.tensor(float(self.input_size)))
+        # 计算向量权重，softmax归一化
+        attention_weight = F.softmax(attention_scores, dim=-1)
+        # 计算输出
+        output = torch.matmul(attention_weight, v)
+        return output
+
+
+x = torch.randn(2, 2, 3)
+Self_Attention = SelfAttention(3)  # 这里的3表示输入向量的维度。
+output = Self_Attention(x)
+print(output.shape)  # [2,2,3]
+
+#通道注意力
+def _make_divisible(v,divisor,min_value=None):
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value,int(v+divisor/2)//divisor*divisor)
+    if new_v < 0.9 * v :
+        new_v+=divisor
+    return new_v
+def hard_sigmoid(x,inplace:bool=False):
+    if inplace:
+        return  x.add_(3.).clamp_(0.,6.).div_(6.)
+    else:
+        return F.relu6(x+3.)/6.
+class SqueezeExcite(nn.Module):
+    def __init__(self,in_chs,se_ratio=0.25,reduced_basw_chs=None,act_layer=nn.ReLU,gate_fn=hard_sigmoid,divisor=4,**_):
+        super(SqueezeExcite,self).__init__()
+        self.gate_fn=gate_fn
+        reduced_chs = _make_divisible((reduced_basw_chs or in_chs)*se_ratio,divisor)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_reduce= nn.Conv2d(in_chs,reduced_chs,1,bias=True)
+        self.act1 = act_layer(inplace=True)
+        self.conv_expand = nn.Conv2d(reduced_chs,in_chs,1,bias=True)
+
+    def forward(self,x):
+        x_se = self.avg_pool(x)
+        x_se = self.conv_reduce(x_se)
+        x_se = self.act1(x_se)
+        x_se = self.conv_expand(x_se)
+        x = x * self.gate_fn(x_se)
+        return x
+
+import torch,torchvision
+import matplotlib.pyplot as plt
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets,transforms
+import numpy as np
+from torchsummary import summary
+import argparse
+#空间注意力
+class STN_Net(nn.Module):
+    def __init__(self,use_stn=True):
+        super(STN_Net,self).__init__()
+        self.conv1 = nn.Conv2d(1,10,kernel_size=5)
+        self.conv2 = nn.Conv2d(10,20,kernel_size=5)
+        self.conv2_drop = nn.Dropout2d()
+        self.fc1 = nn.Linear(320,50)
+        self.fc2 = nn.Linear(50,10)
+        self._use_stn = use_stn
+        self.localization = nn.Sequential(
+            nn.Conv2d(1,8,kernel_size=7),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            # 卷积输出shape为(-1,10,7,7)
+            nn.Conv2d(8, 10, kernel_size=5),
+            # 最大池化层输出shape为(-1,10,3,3)
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        )
+        # 利用全连接层回归\theta参数
+        self.fc_loc = nn.Sequential(
+            nn.Linear(10 * 3 * 3, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 2 * 3)
+        )
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1,0,0,0,1,0],dtype=torch.float))
+    def stn(self,x):
+        xs = self.localization(x)
+        xs = xs.view(-1,10*3*3)
+        theta = self.fc_loc(xs)
+        theta = theta.view(-1,2,3)
+        grid = F.affine_grid(theta,x.size())
+        x = F.grid_sample(x,grid)
+        return x
+
+    def forward(self,x):
+        if self._use_stn:
+            x = self.stn(x)
+
+        x = F.relu(F.max_pool2d(self.conv1(x),2))
+        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)),2))
+        x = x.view(-1,320)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x,training=self.training)
+        x = self.fc2(x)
+
+        return F.log_softmax(x,dim=1)
+
+def get_dataloader(batch_size):
+    # 加载数据集
+    # 如果GPU可用就用GPU,否则用CPU
+    device = torch.device("cuda" if torch.cuda.is_available()
+    					   else "cpu")
+    # 加载训练集
+    train_dataloader = torch.utils.data.DataLoader(
+        datasets.MNIST('./data', train=True, download=True,
+                       transform=transforms.Compose([
+                       transforms.ToTensor(),
+                       transforms.Normalize((0.1307,), (0.3081,))
+                       ])), batch_size=batch_size, shuffle=True)
+
+    # 加载测试集
+    test_dataloader = torch.utils.data.DataLoader(
+        datasets.MNIST('./data', train=False,
+                       transform=transforms.Compose([
+                       transforms.ToTensor(),
+                       transforms.Normalize((0.1307,), (0.3081,))
+                       ])), batch_size=batch_size, shuffle=True)
+
+    return train_dataloader,test_dataloader
+
+def train(net,epoch_nums,lr,train_dataloader,per_batch,device):
+    #使用训练模式
+    net.train()
+    #选择梯度下降优化算法
+    optimizer = optim.SGD(net.parameters(),lr=lr)
+    #训练模型
+    for epoch in range(epoch_nums):
+        for batch_idx,(data,label) in enumerate(train_dataloader):
+            data,label = data.to(device),label.to(device)
+
+            optimizer.zero_grad()
+            pred = net(data)
+            loss = F.nll_loss(pred,label)
+            loss.backward()
+            optimizer.step()
+
+            if batch_idx % per_batch == 0:
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                    epoch, batch_idx * len(data), len(train_dataloader.dataset),
+                           100. * batch_idx / len(train_dataloader), loss.item()))
+
+def evaluate(net,test_dataloader,device):
+    with torch.no_grad():
+        #使用评估模式
+        net.eval()
+        eval_loss = 0
+        eval_acc = 0
+        for data,label in test_dataloader:
+            data,label = data.to(device),label.to(device)
+            pred = net(data)
+
+            eval_loss += F.nll_loss(pred,label,
+            size_average=False).item()
+            pred_label = pred.max(1,keepdim=True)[1]
+            eval_acc += pred_label.eq(label.view_as(pred_label)
+            ).sum().item()
+
+        eval_loss /= len(test_dataloader.dataset)
+        print("evaluate set: Average loss: {:.4f},Accuracy:{}/{}({:.2f}%)\n".format(
+            eval_loss,eval_acc,len(test_dataloader.dataset),
+            100*eval_acc / len(test_dataloader.dataset)))
+
+def tensor_to_array(img_tensor):
+    img_array = img_tensor.numpy().transpose((1, 2, 0))
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    img_array = std * img_array + mean
+    img = np.clip(img_array, 0, 1)
+    return img
+
+def visualize_stn(net,dataloader,device):
+    with torch.no_grad():
+        data = next(iter(dataloader))[0].to(device)
+
+        input_tensor = data.cpu()
+        t_input_tensor = net.stn(data).cpu()
+
+        in_grid = tensor_to_array(torchvision.utils.make_grid(
+        input_tensor))
+        out_grid = tensor_to_array(torchvision.utils.make_grid(
+        t_input_tensor))
+
+        f,axarr = plt.subplots(1,2)
+        axarr[0].imshow(in_grid)
+        axarr[0].set_title("input images")
+
+        axarr[1].imshow(out_grid)
+        axarr[1].set_title("stn transformed images")
+
+        plt.show()
+
+def parse_args():
+    parse = argparse.ArgumentParser("config stn args")
+    parse.add_argument("--lr",default=0.01,
+    type=float,help="learning rate")
+    parse.add_argument("--epoch_nums",default=20,
+    type=int,help="iterated epochs")
+    parse.add_argument("--use_stn",default=True,
+    type=bool,help="whether to use STN module")
+    parse.add_argument("--batch_size",default=64,
+    type=int,help="batch size")
+    parse.add_argument("--use_eval",default=True,
+    type=bool,help="whether to evaluate")
+    parse.add_argument("--use_visual",default=True,
+    type=bool,help="visual STN transform image")
+    parse.add_argument("--use_gpu",default=True,
+    type=bool,help="whether to use GPU")
+    parse.add_argument("--show_net_construct",default=False,
+    type=bool,help="print net construct info")
+    return parse.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.use_gpu and torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+    #加载数据集
+    train_loader,test_loader = get_dataloader(args.batch_size)
+    #创建网络
+    net = STN_Net(args.use_stn).to(device)
+    #打印网络的结构信息
+    if args.show_net_construct:
+        summary(net,(1,28,28))
+    #训练模型
+    train(net,args.epoch_nums,args.lr,train_loader
+    ,args.batch_size,device)
+    if args.use_eval:
+        #评估模型
+        evaluate(net,test_loader,device)
+    if args.use_visual:
+        #可视化展示效果
+        visualize_stn(net,test_loader,device)
+
